@@ -1,9 +1,18 @@
 # -*- coding: utf-8 -
 
-import socket
-import struct
+import logging
+log = logging.getLogger(__name__)
 
-import pb
+import socket
+import ssl
+import struct
+import sys
+
+from . import pb
+
+string_type = str
+if sys.version_info[1] < 3:
+    string_type = basestring
 
 class TransportError(Exception):
     def __init__(self, msg):
@@ -18,40 +27,63 @@ class TCPTransport(object):
         for res in socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM):
             af, socktype, proto, canonname, sa = res
             try:
+                log.debug("Creating socket with %s %s %s", af, socktype, proto)
                 self.sock = socket.socket(af, socktype, proto)
-            except socket.error, e:
+                self.sock.settimeout(15.0)
+            except socket.error as e:
+                log.exception("Exception creating TCP socket: %s", e)
                 self.sock = None
                 continue
             try:
                 self.sock.connect(sa)
-            except socket.error, e:
+            except socket.error as e:
+                log.exception("Exception connecting to TCP socket: %s", e)
                 self.sock.close()
                 self.sock = None
                 continue
             break
         if self.sock is None:
-            raise TransportError("Could not open socket.")
+            raise TransportError("Could not open TCP socket.")
 
     def close(self):
         self.sock.close()
 
+    def read_exactly(self, sock, size):
+        buffer = ''
+        while len(buffer) < size:
+            data = sock.recv(size - len(buffer))
+            if not data:
+                log.debug("Expected to read %s bytes, but read %s bytes", size, len(buffer))
+                break
+            buffer += data
+        return buffer
+
     def write(self, message):
         try:
             # Tx length header and message
+            log.debug("Sending event to Riemann")
             self.sock.sendall(struct.pack('!I', len(message)) + message)
 
             # Rx length header
-            rxlen = struct.unpack('!I', self.sock.recv(4))[0]
+            log.debug("Reading Riemann Response Length Header")
+            response = self.read_exactly(self.sock, 4)
+            rxlen = struct.unpack('!I', response)[0]
+            log.debug("Header Length Is: %d", rxlen)
+
             # Rx entire response
-            response = self.sock.recv(rxlen, socket.MSG_WAITALL)
+            log.debug("Reading Riemann Response")
+            response = self.read_exactly(self.sock, rxlen)
+
             return response
-        except (socket.error, struct.error), e:
+        except (socket.error, struct.error) as e:
+            log.exception("Exception sending event to Riemann over TCP socket: %s", e)
             raise TransportError(str(e))
 
 
 class SSLTransport(TCPTransport):
     def __init__(self, host, port, keyfile=None, certfile=None, ca_certs=None):
-        import ssl
+        log.debug("Using SSL Transport")
+
         TCPTransport.__init__(self, host, port)
 
         self.sock = ssl.wrap_socket(self.sock,
@@ -64,6 +96,8 @@ class SSLTransport(TCPTransport):
 
 class UDPTransport(object):
     def __init__(self, host, port):
+        log.debug("Using UDP Transport")
+
         self.host = None
         self.port = None
         for res in socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_DGRAM):
@@ -71,8 +105,9 @@ class UDPTransport(object):
             try:
                 self.sock = socket.socket(af, socktype, proto)
                 self.host = sa[0]
-                self.port = sa[1] 
-            except socket.error, e:
+                self.port = sa[1]
+            except socket.error as e:
+                log.exception("Exception opening socket: %s", e)
                 self.sock = None
                 continue
             break
@@ -85,7 +120,8 @@ class UDPTransport(object):
     def write(self, message):
         try:
             self.sock.sendto(message, (self.host, self.port))
-        except socket.error, e:
+        except socket.error as e:
+            log.exception("Exception writing to socket: %s", e)
             raise TransportError(str(e))
 
 
@@ -95,7 +131,7 @@ class Event(object):
             self.event = event
         elif params:
             self.event = pb.Event()
-            for key, value in params.iteritems():
+            for key, value in params.items():
                 setattr(self, key, value)
         else:
             self.event = pb.Event()
@@ -113,16 +149,23 @@ class Event(object):
             self.event.tags.extend(value)
         elif name == 'attributes':
             if type(value) == dict:
-                for key in iter(value):
+                for key, val in value.items():
                     a = self.event.attributes.add()
                     a.key = key
-                    a.value = str(value[key])
+                    if isinstance(val, bytes):
+                        val = val.decode('utf-8')
+                    elif not isinstance(val, string_type):
+                        val = string_type(val)
+                    a.value = string_type(val)
             else:
                 raise TypeError("'attributes' parameter must be type 'dict'")
         elif name in set(f.name for f in pb.Event.DESCRIPTOR.fields):
             object.__setattr__(self.event, name, value)
         else:
             object.__setattr__(self, name, value)
+
+    def __str__(self):
+        return str(self.event)
 
 
 class Message(object):
@@ -173,12 +216,13 @@ class Client(object):
     def disconnect(self):
         try:
             self.connection.close()
-        except:
+        except Exception as e:
+            log.exception("Exception disconnecting client: %s", e)
             pass
         self.connection = None
 
     def transmit(self, message):
-        for i in xrange(2):
+        for i in range(2):
             if not self.connection:
                 self.connect()
             try:
@@ -188,8 +232,8 @@ class Client(object):
                 self.disconnect()
         return Message()
 
-    def send(self, event):
-        message = Message(events=[Event(params=event)])
+    def send(self, *events):
+        message = Message(events=[Event(params=event) for event in events])
         response = self.transmit(message)
         return response.ok
 

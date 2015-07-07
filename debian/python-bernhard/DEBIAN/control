@@ -1,8 +1,8 @@
 Package: python-bernhard
 Source: bernhard
-Version: 0.1.1-1
+Version: 0.2.4-1
 Architecture: all
-Maintainer: Eugene Alekseev <ealekseev@clodo.ru>
+Maintainer: Gromak Yuriy <sewer@clodo.ru>
 Installed-Size: 79
 Depends: python (>= 2.7), python (<< 2.8), python-protobuf
 Section: python
